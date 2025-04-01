@@ -55,7 +55,7 @@ def set_axes(axes, xlabel, ylabel, xlim, ylim, xscale, yscale, legend):
 
 def get_dataloader_workers():  # @save
     """Use 4 processes to read the data."""
-    return 4
+    return 2
 
 
 def load_data_cifar10(batch_size, resize=None):  # @save
