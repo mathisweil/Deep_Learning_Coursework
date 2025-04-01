@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="JupyterPersistentConnectionParameters">
+    <option name="knownRemoteServers">
+      <list>
+        <JupyterConnectionParameters>
+          <option name="authType" value="jupyterhub" />
+          <option name="urlString" value="https://hub.comp-teach.qmul.ac.uk" />
+          <authParams2>
+            <map>
+              <entry key="username" value="ec22995" />
+            </map>
+          </authParams2>
+        </JupyterConnectionParameters>
+      </list>
+    </option>
+  </component>
+</project>
