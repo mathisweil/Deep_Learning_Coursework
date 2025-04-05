@@ -1,9 +1,7 @@
 from IPython import display
 from matplotlib import pyplot as plt
 import os
-import multiprocessing
-import gc
-import tqdm
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
@@ -11,27 +9,22 @@ import torchvision
 from torch.utils import data
 from torchvision import transforms
 from matplotlib_inline import backend_inline
-from torchvision.transforms import TrivialAugmentWide
+from torch.utils.data import default_collate
 from torchvision.transforms import v2
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-torch.set_default_device(device)
 torch.backends.cudnn.benchmark = True
-scaler = torch.cuda.amp.GradScaler()
+scaler = torch.GradScaler('cuda')
 
-try:
-    multiprocessing.set_start_method('spawn')
-except RuntimeError:
-    pass
-
-# Data augmentation for training and testing.
+# Data augmentation for training.
 train_augmentations = transforms.Compose([
     transforms.RandomCrop(32, padding=4),
     transforms.RandomHorizontalFlip(),
-    TrivialAugmentWide(),
+    transforms.AutoAugment(policy=transforms.AutoAugmentPolicy.CIFAR10),
     transforms.ToTensor(),
     transforms.Normalize([0.4914, 0.4822, 0.4465],
-                         [0.2023, 0.1994, 0.2010])
+                         [0.2023, 0.1994, 0.2010]),
+    transforms.RandomErasing(p=0.25)
 ])
 
 test_augmentations = transforms.Compose([
@@ -60,17 +53,36 @@ def set_axes(axes: plt.Axes, xlabel: str, ylabel: str, xlim, ylim,
     axes.grid()
 
 
+def get_mixup_cutmix_collate_fn(num_classes: int):
+    """Return a collate function that applies either MixUp or CutMix augmentation.
+
+    This function creates instances of CutMix and MixUp (using the torchvision
+    transforms.v2 implementations) and randomly selects one to apply to each batch.
+    """
+    cutmix = v2.CutMix(num_classes=num_classes)
+    mixup = v2.MixUp(num_classes=num_classes)
+    # Randomly choose between CutMix and MixUp for each batch.
+    cutmix_or_mixup = v2.RandomChoice([cutmix, mixup])
+
+    def collate_fn(batch):
+        # First, collate the batch using the default collate.
+        # Then, apply the chosen augmentation to the batch.
+        return cutmix_or_mixup(*default_collate(batch))
+
+    return collate_fn
+
+
 def get_dataloader_workers() -> int:
     """Return the number of subprocesses to use for data loading."""
     return 2
 
 
-def load_data_cifar10(batch_size: int, resize: int = None):
+def load_data_cifar10(batch_size: int, apply_mixup_cutmix: bool = False):
     """
     Download the CIFAR-10 dataset and return training and testing DataLoaders.
 
+    :param apply_mixup_cutmix:
     :param batch_size: Size of each batch.
-    :param resize: Optional parameter for resizing images (not used here).
     :return: Tuple of (train_loader, test_loader)
     """
     cifar10_train = torchvision.datasets.CIFAR10(
@@ -78,15 +90,20 @@ def load_data_cifar10(batch_size: int, resize: int = None):
     cifar10_test = torchvision.datasets.CIFAR10(
         root="../data", train=False, transform=test_augmentations, download=True)
 
-    generator = torch.Generator(device=device)
+    generator = torch.Generator(device='cpu')
+
+    if apply_mixup_cutmix:
+        collate_fn = get_mixup_cutmix_collate_fn(num_classes=10)
+    else:
+        collate_fn = None
 
     train_loader = data.DataLoader(
         cifar10_train, batch_size=batch_size, shuffle=True, generator=generator,
-        num_workers=get_dataloader_workers(), pin_memory=True)
+        num_workers=get_dataloader_workers(), pin_memory=True, persistent_workers=True, collate_fn=collate_fn)
 
     test_loader = data.DataLoader(
         cifar10_test, batch_size=batch_size, shuffle=False, generator=generator,
-        num_workers=get_dataloader_workers(), pin_memory=True)
+        num_workers=get_dataloader_workers(), pin_memory=True, persistent_workers=True)
 
     return train_loader, test_loader
 
@@ -108,6 +125,8 @@ class Animator:
             self.axes[0], xlabel, ylabel, xlim, ylim, xscale, yscale, legend)
         self.X, self.Y, self.fmts = None, None, fmts
 
+        self.display_handle = display.display(self.fig, display_id=True)
+
     def add(self, x, y) -> None:
         """Add a new data point and update the plot."""
         if not hasattr(y, "__len__"):
@@ -127,8 +146,9 @@ class Animator:
         for x_vals, y_vals, fmt in zip(self.X, self.Y, self.fmts):
             self.axes[0].plot(x_vals, y_vals, fmt)
         self.config_axes()
-        display.display(self.fig)
-        display.clear_output(wait=True)
+        self.display_handle.update(self.fig)
+        # display.display(self.fig)
+        # display.clear_output(wait=True)
 
 
 class Accumulator:
@@ -181,6 +201,35 @@ def evaluate_accuracy(net, data_iter, device=None) -> float:
     return metric[0] / metric[1]
 
 
+def evaluate_loss(net, data_iter, loss, device=None) -> float:
+    """
+    Compute the average loss of a model on a dataset.
+
+    :param net: The neural network model.
+    :param data_iter: DataLoader for the evaluation dataset.
+    :param loss: Loss function.
+    :param device: The device to use.
+    :return: Average loss as a float.
+    """
+    if isinstance(net, nn.Module):
+        net.eval()
+        if device is None:
+            device = next(iter(net.parameters())).device
+    total_loss, total_count = 0.0, 0
+    with torch.no_grad():
+        for X, y in data_iter:
+            if isinstance(X, list):
+                X = [x.to(device, non_blocking=True) for x in X]
+            else:
+                X = X.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            y_hat = net(X)
+            l = loss(y_hat, y)
+            total_loss += l.item() * y.size(0)
+            total_count += y.size(0)
+    return total_loss / total_count
+
+
 def train_epoch(net, train_iter, loss, optimizer):
     """
     Train the model for one epoch.
@@ -194,7 +243,7 @@ def train_epoch(net, train_iter, loss, optimizer):
     for X, y in progress_bar:
         X, y = X.to(device, non_blocking=True), y.to(device, non_blocking=True)
         optimizer.zero_grad()
-        with torch.cuda.amp.autocast():
+        with torch.autocast('cuda'):
             y_hat = net(X)
             l = loss(y_hat, y)
         scaler.scale(l).backward()
@@ -212,7 +261,7 @@ def train_epoch(net, train_iter, loss, optimizer):
 def train(net, train_iter, test_iter, loss, num_epochs: int, optimizer, scheduler,
           checkpoint_path: str = 'checkpoints'):
     """
-    Train a model and save checkpoints periodically with TensorBoard logging.
+    Train a model and save checkpoints periodically.
 
     :param net: Neural network model.
     :param train_iter: Training DataLoader.
@@ -236,16 +285,21 @@ def train(net, train_iter, test_iter, loss, num_epochs: int, optimizer, schedule
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
 
-    animator = Animator(xlabel='epoch', xlim=[1, num_epochs], ylim=[0, 1],
-                        legend=['train loss', 'train acc', 'test acc'])
+    # Animator for losses (train and test)
+    animator_loss = Animator(xlabel='epoch', ylabel='loss', xlim=[1, num_epochs], ylim=[0, 2.5],
+                             legend=['train loss', 'test loss'], figsize=(3.5, 2.5))
+    # Animator for accuracies (train and test)
+    animator_acc = Animator(xlabel='epoch', ylabel='accuracy', xlim=[1, num_epochs], ylim=[0, 1],
+                            legend=['train acc', 'test acc'], figsize=(3.5, 2.5))
 
     for epoch in range(start_epoch, num_epochs):
         train_loss, train_acc = train_epoch(net, train_iter, loss, optimizer)
         test_acc = evaluate_accuracy(net, test_iter, device)
+        test_loss = evaluate_loss(net, test_iter, loss, device)
 
-        animator.add(epoch + 1, (train_loss, train_acc, test_acc))
-        torch.cuda.empty_cache()
-        gc.collect()
+        # Update both plots
+        animator_loss.add(epoch + 1, (train_loss, test_loss))
+        animator_acc.add(epoch + 1, (train_acc, test_acc))
 
         scheduler.step()
 
